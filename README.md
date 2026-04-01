@@ -1,6 +1,6 @@
-# WaveLetFusion
+# FDRFusion
 
-WaveLetFusion is a PyTorch-based project for cross-modal infrared-visible image registration and fusion.
+
 
 This repository provides:
 
