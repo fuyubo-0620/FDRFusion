@@ -1,0 +1,7 @@
+
+numpy>=1.24
+opencv-python>=4.8
+tqdm>=4.66
+kornia>=0.7
+timm>=0.9
+torchvision>=0.16
