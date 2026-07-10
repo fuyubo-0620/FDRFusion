@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Effect size analysis for FDRFusion.
+
+Expected wide-format CSV:
+
+dataset,method,original_id,aug_id,AG,EI,EN,SD,SF,CV,RMSEreg,Qabf
+RoadScene,FDRFusion,0001,0,...
+RoadScene,C2RF,0001,0,...
+RoadScene,MulFS-CAP,0001,0,...
+...
+
+The script:
+1. averages multiple augmented samples from the same original image pair;
+2. selects the strongest competing baseline for each dataset and metric;
+3. computes paired, bias-corrected standardized mean difference, i.e., Hedges' g;
+4. reverses the sign direction for lower-is-better metrics such as RMSEreg;
+5. reports mean effect size and positive effect ratio.
+"""
+
+import argparse
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compute paired Hedges' g effect size for FDRFusion."
+    )
+
+    parser.add_argument("--input", type=str, required=True,
+                        help="Path to per-sample metric CSV file.")
+    parser.add_argument("--output-dir", type=str, default="effect_size_results",
+                        help="Directory for output CSV and LaTeX files.")
+
+    parser.add_argument("--ours", type=str, default="FDRFusion",
+                        help="Name of the proposed method in the CSV file.")
+
+    parser.add_argument("--dataset-col", type=str, default="dataset")
+    parser.add_argument("--method-col", type=str, default="method")
+    parser.add_argument("--id-col", type=str, default="original_id")
+    parser.add_argument("--aug-col", type=str, default="aug_id")
+
+    parser.add_argument("--metrics", nargs="+", default=None,
+                        help="Metric columns. If omitted, numeric columns are used.")
+    parser.add_argument("--lower-better", nargs="+", default=["RMSEreg"],
+                        help="Metrics for which lower values indicate better performance.")
+
+    parser.add_argument("--baseline-mode", type=str, default="best",
+                        choices=["best", "specified"],
+                        help="Use the best baseline per metric, or a specified baseline.")
+    parser.add_argument("--baseline-name", type=str, default=None,
+                        help="Baseline method name when --baseline-mode specified is used.")
+
+    parser.add_argument("--bootstrap", type=int, default=10000,
+                        help="Number of bootstrap samples for 95%% CI. Set 0 to disable.")
+    parser.add_argument("--seed", type=int, default=2026,
+                        help="Random seed for bootstrap confidence intervals.")
+
+    return parser.parse_args()
+
+
+def hedges_correction(df):
+    """
+    Small-sample correction factor:
+    J(df) = 1 - 3 / (4df - 1),
+    where df = n - 1 for paired differences.
+    """
+    if df <= 0:
+        return np.nan
+    return 1.0 - 3.0 / (4.0 * df - 1.0)
+
+
+def paired_hedges_g(diff):
+    """
+    Compute bias-corrected paired standardized mean difference.
+
+    diff should already be direction-normalized:
+    positive values indicate that FDRFusion is better.
+    """
+    diff = np.asarray(diff, dtype=float)
+    diff = diff[np.isfinite(diff)]
+
+    n = len(diff)
+    if n < 2:
+        return np.nan
+
+    mean_diff = np.mean(diff)
+    sd_diff = np.std(diff, ddof=1)
+
+    if np.isclose(sd_diff, 0.0):
+        return np.nan
+
+    j = hedges_correction(n - 1)
+    return j * mean_diff / sd_diff
+
+
+def bootstrap_ci(diff, n_boot=10000, seed=2026, alpha=0.05):
+    """
+    Paired bootstrap CI for Hedges' g.
+    Resampling unit is the original image pair.
+    """
+    diff = np.asarray(diff, dtype=float)
+    diff = diff[np.isfinite(diff)]
+
+    n = len(diff)
+    if n < 2 or n_boot <= 0:
+        return np.nan, np.nan
+
+    rng = np.random.default_rng(seed)
+    boot_values = []
+
+    for _ in range(n_boot):
+        sample = rng.choice(diff, size=n, replace=True)
+        g = paired_hedges_g(sample)
+        if np.isfinite(g):
+            boot_values.append(g)
+
+    if len(boot_values) == 0:
+        return np.nan, np.nan
+
+    low = np.percentile(boot_values, 100 * alpha / 2)
+    high = np.percentile(boot_values, 100 * (1 - alpha / 2))
+    return low, high
+
+
+def infer_metric_columns(df, args):
+    excluded = {
+        args.dataset_col,
+        args.method_col,
+        args.id_col,
+        args.aug_col,
+    }
+
+    numeric_cols = [
+        c for c in df.columns
+        if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+    if not numeric_cols:
+        raise ValueError(
+            "No metric columns were found. Please specify them using --metrics."
+        )
+
+    return numeric_cols
+
+
+def positive_ratio(series):
+    values = series.dropna()
+    if len(values) == 0:
+        return np.nan
+    return 100.0 * np.mean(values > 0)
+
+
+def main():
+    args = parse_args()
+
+    input_path = Path(args.input)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.read_csv(input_path)
+
+    if args.dataset_col not in df.columns:
+        df[args.dataset_col] = "All"
+
+    required_cols = [args.dataset_col, args.method_col, args.id_col]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Required column not found: {col}")
+
+    if args.metrics is None:
+        metrics = infer_metric_columns(df, args)
+    else:
+        metrics = args.metrics
+
+    missing_metrics = [m for m in metrics if m not in df.columns]
+    if missing_metrics:
+        raise ValueError(f"Metric columns not found: {missing_metrics}")
+
+    lower_better = set(args.lower_better)
+
+    if args.baseline_mode == "specified" and args.baseline_name is None:
+        raise ValueError(
+            "--baseline-name must be provided when --baseline-mode specified is used."
+        )
+
+    # Ensure stable identifiers.
+    df[args.dataset_col] = df[args.dataset_col].astype(str)
+    df[args.method_col] = df[args.method_col].astype(str)
+    df[args.id_col] = df[args.id_col].astype(str)
+
+    # Step 1:
+    # Average augmented samples from the same original image pair.
+    # This avoids treating augmentations from the same original pair as independent samples.
+    agg = (
+        df.groupby(
+            [args.dataset_col, args.method_col, args.id_col],
+            as_index=False
+        )[metrics]
+        .mean()
+    )
+
+    detail_rows = []
+    rng_seed = args.seed
+
+    datasets = sorted(agg[args.dataset_col].unique())
+
+    for dataset in datasets:
+        data_d = agg[agg[args.dataset_col] == dataset]
+
+        if args.ours not in data_d[args.method_col].unique():
+            print(f"[Warning] Ours method '{args.ours}' not found in dataset {dataset}.")
+            continue
+
+        for metric in metrics:
+            metric_is_lower_better = metric in lower_better
+
+            ours_df = data_d[data_d[args.method_col] == args.ours][
+                [args.id_col, metric]
+            ].rename(columns={metric: "ours"})
+
+            baseline_data = data_d[data_d[args.method_col] != args.ours]
+
+            if baseline_data.empty:
+                print(f"[Warning] No baseline methods found for dataset {dataset}.")
+                continue
+
+            # Step 2:
+            # Select comparison baseline.
+            if args.baseline_mode == "specified":
+                baseline_name = args.baseline_name
+                if baseline_name not in baseline_data[args.method_col].unique():
+                    print(
+                        f"[Warning] Baseline '{baseline_name}' not found "
+                        f"for dataset {dataset}, metric {metric}."
+                    )
+                    continue
+            else:
+                baseline_means = baseline_data.groupby(args.method_col)[metric].mean()
+
+                if metric_is_lower_better:
+                    baseline_name = baseline_means.idxmin()
+                else:
+                    baseline_name = baseline_means.idxmax()
+
+            base_df = baseline_data[
+                baseline_data[args.method_col] == baseline_name
+            ][[args.id_col, metric]].rename(columns={metric: "base"})
+
+            merged = pd.merge(ours_df, base_df, on=args.id_col, how="inner")
+            merged = merged.dropna(subset=["ours", "base"])
+
+            n_pairs = len(merged)
+            if n_pairs < 2:
+                print(
+                    f"[Warning] Less than 2 paired samples for "
+                    f"{dataset}, {metric}, baseline={baseline_name}."
+                )
+                continue
+
+            # Step 3:
+            # Direction normalization.
+            # Positive difference always means FDRFusion is better.
+            if metric_is_lower_better:
+                diff = merged["base"].values - merged["ours"].values
+                direction = "lower-is-better; diff = baseline - ours"
+            else:
+                diff = merged["ours"].values - merged["base"].values
+                direction = "higher-is-better; diff = ours - baseline"
+
+            g = paired_hedges_g(diff)
+
+            if args.bootstrap > 0:
+                ci_low, ci_high = bootstrap_ci(
+                    diff,
+                    n_boot=args.bootstrap,
+                    seed=rng_seed,
+                    alpha=0.05
+                )
+                rng_seed += 1
+            else:
+                ci_low, ci_high = np.nan, np.nan
+
+            detail_rows.append({
+                "dataset": dataset,
+                "metric": metric,
+                "baseline": baseline_name,
+                "n_original_pairs": n_pairs,
+                "mean_ours": float(np.mean(merged["ours"].values)),
+                "mean_baseline": float(np.mean(merged["base"].values)),
+                "mean_directional_diff": float(np.mean(diff)),
+                "sd_directional_diff": float(np.std(diff, ddof=1)),
+                "hedges_g": float(g) if np.isfinite(g) else np.nan,
+                "ci95_low": float(ci_low) if np.isfinite(ci_low) else np.nan,
+                "ci95_high": float(ci_high) if np.isfinite(ci_high) else np.nan,
+                "positive_effect": bool(g > 0) if np.isfinite(g) else False,
+                "direction_rule": direction,
+            })
+
+    detail_df = pd.DataFrame(detail_rows)
+
+    if detail_df.empty:
+        raise RuntimeError("No effect size results were computed.")
+
+    # Save detailed results.
+    detail_path = output_dir / "effect_size_detail.csv"
+    detail_df.to_csv(detail_path, index=False)
+
+    # Step 4:
+    # Build paper-style table: one row per dataset.
+    table_df = detail_df.pivot(
+        index="dataset",
+        columns="metric",
+        values="hedges_g"
+    ).reset_index()
+
+    metric_cols_available = [m for m in metrics if m in table_df.columns]
+    table_df = table_df[["dataset"] + metric_cols_available]
+
+    summary_df = (
+        detail_df.groupby("dataset")
+        .agg(
+            mean_g=("hedges_g", "mean"),
+            positive_es_percent=("hedges_g", positive_ratio)
+        )
+        .reset_index()
+    )
+
+    table_df = pd.merge(table_df, summary_df, on="dataset", how="left")
+
+    # Overall row:
+    overall_row = {"dataset": "Overall"}
+
+    for metric in metric_cols_available:
+        overall_row[metric] = detail_df.loc[
+            detail_df["metric"] == metric, "hedges_g"
+        ].mean()
+
+    overall_row["mean_g"] = detail_df["hedges_g"].mean()
+    overall_row["positive_es_percent"] = positive_ratio(detail_df["hedges_g"])
+
+    table_df = pd.concat(
+        [table_df, pd.DataFrame([overall_row])],
+        ignore_index=True
+    )
+
+    table_path = output_dir / "effect_size_table.csv"
+    table_df.to_csv(table_path, index=False)
+
+    # Save LaTeX table.
+    latex_df = table_df.copy()
+    latex_df = latex_df.rename(columns={
+        "dataset": "Dataset",
+        "mean_g": r"$\bar{g}$",
+        "positive_es_percent": r"ES(\%)"
+    })
+
+    latex_path = output_dir / "effect_size_table.tex"
+    with open(latex_path, "w", encoding="utf-8") as f:
+        f.write(
+            latex_df.to_latex(
+                index=False,
+                escape=False,
+                float_format=lambda x: f"{x:.3f}"
+            )
+        )
+
+    print("Effect size analysis finished.")
+    print(f"Detailed results saved to: {detail_path}")
+    print(f"Paper-style table saved to: {table_path}")
+    print(f"LaTeX table saved to: {latex_path}")
+
+
+if __name__ == "__main__":
+    main()
